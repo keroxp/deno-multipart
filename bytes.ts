@@ -38,10 +38,7 @@ export function bytesFindLastIndex(a: Uint8Array, pat: Uint8Array) {
   return -1;
 }
 
-export function bytesEqual(
-  a: Uint8Array,
-  match: Uint8Array
-): boolean {
+export function bytesEqual(a: Uint8Array, match: Uint8Array): boolean {
   if (a.length !== match.length) return false;
   for (let i = 0; i < match.length; i++) {
     if (a[i] !== match[i]) return false;
@@ -49,10 +46,7 @@ export function bytesEqual(
   return true;
 }
 
-export function bytesHasPrefix(
-  a: Uint8Array,
-  prefix: Uint8Array
-): boolean {
+export function bytesHasPrefix(a: Uint8Array, prefix: Uint8Array): boolean {
   for (let i = 0, max = prefix.length; i < max; i++) {
     if (a[i] !== prefix[i]) return false;
   }

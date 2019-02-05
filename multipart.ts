@@ -1,15 +1,16 @@
-import {Buffer, Closer, copy, Reader, ReadResult, remove, Writer} from "deno";
-import {copyN, MultiReader, tempfile} from "./ioutil.ts";
-import {FileHeader, FormFile} from "./formfile.ts";
+import { Buffer, Closer, copy, Reader, ReadResult, remove, Writer } from "deno";
+import { copyN, MultiReader, StringWriter, tempfile } from "./ioutil.ts";
+import { FileHeader, FormFile } from "./formfile.ts";
 import {
   bytesFindIndex,
   bytesFindLastIndex,
   bytesHasPrefix,
   bytesEqual
 } from "./bytes.ts";
-import {BufReader, BufState, BufWriter, TextProtoReader} from "./deps.ts";
+import { BufReader, BufState, BufWriter, TextProtoReader } from "./deps.ts";
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 function randomBoundary() {
   let boundary = "--------------------------";
@@ -19,9 +20,13 @@ function randomBoundary() {
   return boundary;
 }
 
-export class MultipartReader implements Reader {
+function println(...s: any) {
+  console.log(...s, "\n");
+}
+
+export class MultipartReader {
   readonly newLine = encoder.encode("\r\n");
-  readonly newLineDashBoundary = encoder.encode(`\r\n${this.boundary}`);
+  readonly newLineDashBoundary = encoder.encode(`\r\n--${this.boundary}`);
   readonly dashBoundaryDash = encoder.encode(`--${this.boundary}--`);
   readonly dashBoundary = encoder.encode(`--${this.boundary}`);
   readonly bufReader: BufReader;
@@ -30,15 +35,11 @@ export class MultipartReader implements Reader {
     this.bufReader = new BufReader(reader);
   }
 
-  read(p: Uint8Array): Promise<ReadResult> {
-    return this.currentPart.read(p);
-  }
-
   async readForm(maxMemory: number): Promise<FormData> {
     const form = new FormData();
-    let maxValueBytes = (maxMemory + 10) << 20;
-    const buf = new Buffer();
-    for (; ;) {
+    let maxValueBytes = maxMemory + (10 << 20);
+    const buf = new Buffer(new Uint8Array(maxValueBytes));
+    for (;;) {
       const p = await this.nextPart();
       if (!p) {
         break;
@@ -54,8 +55,8 @@ export class MultipartReader implements Reader {
         if (maxValueBytes < 0) {
           throw new RangeError("message too large");
         }
-        form.set(p.formName, buf.toString());
-        console.log(n, p.formName, buf.toString())
+        const value = buf.toString();
+        form.set(p.formName, value);
         continue;
       }
       // file
@@ -63,12 +64,16 @@ export class MultipartReader implements Reader {
         filename: p.fileName,
         headers: p.headers
       };
-      const n = await copyN(buf, p, maxValueBytes);
+      const n = await copy(buf, p);
       if (n > maxMemory) {
         // too big, write to disk and flush buffer
-        const {file, filepath} = await tempfile("", "multipart-");
+        const { file, filepath } = await tempfile("", "multipart-");
         try {
-          const size = await copy(file, new MultiReader(buf, p));
+          const size = await copyN(
+            file,
+            new MultiReader(buf, p),
+            maxValueBytes
+          );
           file.close();
           fileHeader.tempfile = filepath;
           fileHeader.size = size;
@@ -97,13 +102,13 @@ export class MultipartReader implements Reader {
       throw new Error("boundary is empty");
     }
     let expectNewPart = false;
-    for (; ;) {
+    for (;;) {
       const [line, state] = await this.bufReader.readSlice("\n".charCodeAt(0));
       if (state === "EOF" && this.isFinalBoundary(line)) {
         break;
       }
       if (state) {
-        throw new Error(state.toString());
+        throw new Error("aa" + state.toString());
       }
       if (this.isBoundaryDelimiterLine(line)) {
         this.partsRead++;
@@ -150,109 +155,99 @@ export class MultipartReader implements Reader {
   }
 }
 
-
 function skipLWSPChar(u: Uint8Array): Uint8Array {
-  const ret = new Uint8Array(u.length)
+  const ret = new Uint8Array(u.length);
   const sp = " ".charCodeAt(0);
   const ht = "\t".charCodeAt(0);
   let j = 0;
   for (let i = 0; i < u.length; i++) {
     if (u[i] === sp || u[i] === ht) continue;
-    ret[j++] = u[i]
+    ret[j++] = u[i];
   }
-  return ret.slice(0, j)
+  return ret.slice(0, j);
 }
 
+let i = 0;
 class PartReader implements Reader, Closer {
-  n: number;
-  total: number;
-
-  constructor(private mr: MultipartReader, public readonly headers: Headers) {
-  }
+  n: number = 0;
+  total: number = 0;
+  bufState: BufState = null;
+  index = i++;
+  constructor(private mr: MultipartReader, public readonly headers: Headers) {}
 
   async read(p: Uint8Array): Promise<ReadResult> {
     const br = this.mr.bufReader;
-    if (this.n === 0) {
-      const [peek, state] = await br.peek(br.buffered());
-      const [n] = this.scanUntilBoundary(peek);
-      this.n = n
-      if (this.n === 0) {
-        const [_, eof] = await br.peek(peek.length + 1);
-        if (eof) {
-          throw new RangeError("unexpected eof")
+    const returnResult = (nread: number, bufState: BufState): ReadResult => {
+      if (bufState && bufState !== "EOF") {
+        throw bufState;
+      }
+      return { nread, eof: bufState === "EOF" };
+    };
+    if (this.n === 0 && !this.bufState) {
+      const [peek] = await br.peek(br.buffered());
+      const [n, state] = scanUntilBoundary(
+        peek,
+        this.mr.dashBoundary,
+        this.mr.newLineDashBoundary,
+        this.total,
+        this.bufState
+      );
+      this.n = n;
+      this.bufState = state;
+      if (this.n === 0 && !this.bufState) {
+        const [_, state] = await br.peek(peek.length + 1);
+        this.bufState = state;
+        if (this.bufState === "EOF") {
+          this.bufState = new RangeError("unexpected eof");
         }
       }
     }
     if (this.n === 0) {
-      return {nread: 0, eof: false};
+      return returnResult(0, this.bufState);
     }
-    let n = p.byteLength;
-    if (n > this.n) {
+
+    let n = 0;
+    if (p.byteLength > this.n) {
       n = this.n;
     }
     const buf = p.slice(0, n);
-    const [nread, state] = await br.readFull(buf);
+    const [nread] = await this.mr.bufReader.readFull(buf);
+    p.set(buf);
     this.total += nread;
     this.n -= nread;
-    return {nread, eof: state === "EOF"};
-  }
-
-  close(): void {
-  }
-
-  private scanUntilBoundary(buf: Uint8Array): [number, boolean] {
-    if (this.total === 0) {
-      if (bytesHasPrefix(buf, this.mr.dashBoundary)) {
-        switch (matchAfterPrefix(buf, this.mr.dashBoundary)) {
-          case -1:
-            return [this.mr.dashBoundary.length, false];
-          case 0:
-            return [0, false];
-          case 1:
-            return [0, true];
-        }
-      }
-      const i = bytesFindIndex(buf, this.mr.newLineDashBoundary);
-      if (i >= 0) {
-        switch (matchAfterPrefix(buf.slice(i), this.mr.newLineDashBoundary)) {
-          case -1:
-            return [i + this.mr.newLineDashBoundary.length, false];
-          case 0:
-            return [i, false];
-          case 1:
-            return [i, false];
-        }
-      }
-      if (bytesHasPrefix(this.mr.newLineDashBoundary, buf)) {
-        return [0, false];
-      }
-      const j = bytesFindLastIndex(
-        buf,
-        this.mr.newLineDashBoundary.slice(0, 1)
-      );
-      if (j >= 0 && bytesHasPrefix(this.mr.newLineDashBoundary, buf.slice(j))) {
-        return [j, false];
-      }
-      return [buf.length, false];
+    if (this.n === 0) {
+      return returnResult(n, this.bufState);
     }
+    return returnResult(n, null);
   }
 
-  private contentDisposition: string
+  close(): void {}
+
+  private contentDisposition: string;
   private contentDispositionParams: { [key: string]: string };
 
   private getContentDispositionParams() {
     if (this.contentDispositionParams) return this.contentDispositionParams;
     const cd = this.headers.get("content-disposition");
     const params = {};
-    const comps = cd.split(";")
-    this.contentDisposition = comps[0]
-    comps.slice(1)
+    const comps = cd.split(";");
+    this.contentDisposition = comps[0];
+    comps
+      .slice(1)
       .map(v => v.trim())
       .map(kv => {
         const [k, v] = kv.split("=");
-        params[k] = v;
+        if (v) {
+          const s = v.charAt(0);
+          const e = v.charAt(v.length - 1);
+          if ((s === e && s === '"') || s === "'") {
+            params[k] = v.substr(1, v.length - 2);
+          } else {
+            params[k] = v;
+          }
+        }
       });
-    return this.contentDispositionParams = params;
+    return (this.contentDispositionParams = params);
   }
 
   get fileName(): string {
@@ -260,22 +255,73 @@ class PartReader implements Reader, Closer {
   }
 
   get formName(): string {
-    const p = this.getContentDispositionParams()
+    const p = this.getContentDispositionParams();
     if (this.contentDisposition === "form-data") {
-      return p["name"]
+      return p["name"];
     }
-    return ""
+    return "";
   }
 }
 
-function matchAfterPrefix(a: Uint8Array, prefix: Uint8Array): number {
+export function scanUntilBoundary(
+  buf: Uint8Array,
+  dashBoundary: Uint8Array,
+  newLineDashBoundary: Uint8Array,
+  total: number,
+  state: BufState
+): [number, BufState] {
+  if (total === 0) {
+    if (bytesHasPrefix(buf, dashBoundary)) {
+      switch (matchAfterPrefix(buf, dashBoundary, state)) {
+        case -1:
+          return [dashBoundary.length, null];
+        case 0:
+          return [0, null];
+        case 1:
+          return [0, "EOF"];
+      }
+      if (bytesHasPrefix(dashBoundary, buf)) {
+        return [0, state];
+      }
+    }
+  }
+  const i = bytesFindIndex(buf, newLineDashBoundary);
+  if (i >= 0) {
+    switch (matchAfterPrefix(buf.slice(i), newLineDashBoundary, state)) {
+      case -1:
+        return [i + newLineDashBoundary.length, null];
+      case 0:
+        return [i, null];
+      case 1:
+        return [i, "EOF"];
+    }
+  }
+  if (bytesHasPrefix(newLineDashBoundary, buf)) {
+    return [0, state];
+  }
+  const j = bytesFindLastIndex(buf, newLineDashBoundary.slice(0, 1));
+  if (j >= 0 && bytesHasPrefix(newLineDashBoundary, buf.slice(j))) {
+    return [j, null];
+  }
+  return [buf.length, state];
+}
+
+export function matchAfterPrefix(
+  a: Uint8Array,
+  prefix: Uint8Array,
+  bufState: BufState
+): number {
   if (a.length === prefix.length) {
+    if (bufState) {
+      return 1;
+    }
     return 0;
   }
   const c = a[prefix.length];
   if (
     c === " ".charCodeAt(0) ||
     c === "\t".charCodeAt(0) ||
+    c === "\r".charCodeAt(0) ||
     c === "\n".charCodeAt(0) ||
     c === "-".charCodeAt(0)
   ) {
@@ -297,7 +343,7 @@ class PartWriter implements Writer {
   ) {
     let buf = "";
     if (isFirstBoundary) {
-      buf += `--${this.boundary}\r\n`
+      buf += `--${boundary}\r\n`;
     } else {
       buf += `\r\n--${boundary}\r\n`;
     }
@@ -324,7 +370,7 @@ class PartWriter implements Writer {
   }
 }
 
-export class MultipartWriter implements Writer, Closer {
+export class MultipartWriter {
   private _boundary: string;
 
   setBoundary(b: string) {
@@ -358,10 +404,6 @@ export class MultipartWriter implements Writer, Closer {
     this.bufWriter = new BufWriter(writer);
   }
 
-  async write(p: Uint8Array): Promise<number> {
-    return this.bufWriter.write(p);
-  }
-
   flush(): Promise<BufState> {
     return this.bufWriter.flush();
   }
@@ -377,7 +419,12 @@ export class MultipartWriter implements Writer, Closer {
     if (this.lastPart) {
       this.lastPart.close();
     }
-    const part = new PartWriter(this, this.boundary, headers, !this.lastPart);
+    const part = new PartWriter(
+      this.writer,
+      this.boundary,
+      headers,
+      !this.lastPart
+    );
     this.lastPart = part;
     return part;
   }
@@ -414,7 +461,7 @@ export class MultipartWriter implements Writer, Closer {
       this.lastPart.close();
       this.lastPart = void 0;
     }
-    await this.write(encoder.encode(`\r\n--${this.boundary}--\r\n`));
+    await this.writer.write(encoder.encode(`\r\n--${this.boundary}--\r\n`));
     await this.flush();
   }
 }

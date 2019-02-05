@@ -1,33 +1,98 @@
-import {assertEqual, runTests, test} from "./deps.ts";
-import {MultipartReader, MultipartWriter} from "./multipart.ts";
-import {Buffer, copy, open} from "deno";
-import {stringsReader} from "https://deno.land/x/std@v0.2.8/io/util.ts";
+import { assertEqual, runTests, setFilter, test } from "./deps.ts";
+import {
+  matchAfterPrefix,
+  MultipartReader,
+  MultipartWriter,
+  scanUntilBoundary
+} from "./multipart.ts";
+import { Buffer, copy, open } from "deno";
 
-test(async function testWriter () {
-    const buf = new Buffer()
-    const mw = new MultipartWriter(buf)
-    await mw.writeField("foo", "foo")
-    await mw.writeField("bar", "bar")
-    const f = await open("./tsconfig.json", "r")
-    await mw.writeFile("file", "tsconfig.json", f)
-    await mw.close()
-    const b = buf.toString()
-})
+const e = new TextEncoder();
+const d = new TextDecoder();
+const boundary = "--abcde";
+const dashBoundary = e.encode("--" + boundary);
+const nlDashBoundary = e.encode("\r\n--" + boundary);
+test(function testScanUntilBoundary1() {
+  const data = `--${boundary}`;
+  const [n, err] = scanUntilBoundary(
+    e.encode(data),
+    dashBoundary,
+    nlDashBoundary,
+    0,
+    "EOF"
+  );
+  assertEqual(n, 0);
+  assertEqual(err, "EOF");
+});
+test(function testScanUntilBoundary2() {
+  const data = `foo\r\n--${boundary}`;
+  const [n, err] = scanUntilBoundary(
+    e.encode(data),
+    dashBoundary,
+    nlDashBoundary,
+    0,
+    "EOF"
+  );
+  assertEqual(n, 3);
+  assertEqual(err, "EOF");
+});
+test(function testScanUntilBoundary4() {
+  const data = `foo\r\n--`;
+  const [n, err] = scanUntilBoundary(
+    e.encode(data),
+    dashBoundary,
+    nlDashBoundary,
+    0,
+    null
+  );
+  assertEqual(n, 3);
+  assertEqual(err, null);
+});
+test(function testScanUntilBoundary3() {
+  const data = `foobar`;
+  const [n, err] = scanUntilBoundary(
+    e.encode(data),
+    dashBoundary,
+    nlDashBoundary,
+    0,
+    null
+  );
+  assertEqual(n, data.length);
+  assertEqual(err, null);
+});
+
+test(function testMatchAfterPrefix1() {
+  const data = `${boundary}\r`;
+  const v = matchAfterPrefix(e.encode(data), e.encode(boundary), null);
+  assertEqual(v, 1);
+});
+test(function testMatchAfterPrefix2() {
+  const data = `${boundary}hoge`;
+  const v = matchAfterPrefix(e.encode(data), e.encode(boundary), null);
+  assertEqual(v, -1);
+});
+test(function testMatchAfterPrefix3() {
+  const data = `${boundary}`;
+  const v = matchAfterPrefix(e.encode(data), e.encode(boundary), null);
+  assertEqual(v, 0);
+});
+test(async function testWriter() {
+  const buf = new Buffer();
+  const mw = new MultipartWriter(buf);
+  await mw.writeField("foo", "foo");
+  await mw.writeField("bar", "bar");
+  const f = await open("./tsconfig.json", "r");
+  await mw.writeFile("file", "tsconfig.json", f);
+  await mw.close();
+});
 test(async function testReader() {
-  let buf = new Buffer()
-  const mw = new MultipartWriter(buf)
-  await mw.writeField("foo", "foo")
-  await mw.writeField("bar", "bar")
-  let f = await open("./tsconfig.json", "r")
-  await mw.writeFile("file", "tsconfig.json", f)
-  await mw.close()
-  f.close()
-  const b = buf.toString()
-  const mr = new MultipartReader(stringsReader(b), mw.boundary)
-  const form = await mr.readForm(10 << 20)
-  assertEqual(form.get("foo"), "foo")
-  assertEqual(form.get("bar"), "bar")
-  const file = form.get("file") as domTypes.DomFile
-  assertEqual(file.name, "./tsconfig.json")
-})
-runTests()
+  const o = await open("fixtures/sample.txt");
+  const mr = new MultipartReader(
+    o,
+    "--------------------------434049563556637648550474"
+  );
+  const form = await mr.readForm(10 << 20);
+  assertEqual(form.get("foo"), "foo");
+  assertEqual(form.get("bar"), "bar");
+});
+setTimeout(runTests, 0);
